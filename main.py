@@ -1,5 +1,7 @@
 import streamlit as st
-from langchain_ollama import ChatOllama
+import pandas as pd
+import numpy as np
+from langchain_openai import ChatOpenAI
 from langchain.schema import (
     HumanMessage,
     SystemMessage,
@@ -7,256 +9,311 @@ from langchain.schema import (
 )
 import os
 import glob
+import re
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-# --- Helper Functions ---
-def get_avatar(agent_name):
-    """Returns a unique emoji avatar for each agent."""
-    avatars = {
-        "Explorer": "🌍", "Historian": "📜", "Scientist": "🔬",
-        "Philosopher": "🤔", "Poet": "✍️", "Musician": "🎵",
-        "Chef": "🧑‍🍳", "Detective": "🕵️‍♂️"
-    }
-    # Simple hash to get a consistent emoji for a given name
-    hash_val = sum(ord(c) for c in agent_name)
-    default_emojis = list("🤖🧠💡💬🗣️👤🧑‍💻")
-    return avatars.get(agent_name, default_emojis[hash_val % len(default_emojis)])
+# --- Configuration & Constants ---
+PERSONAS_DIR = "personas"
+INITIAL_CASH = 100000
+STOCKS = ['TECH', 'HEALTH', 'ENERGY', 'FINANCE']
 
-def setup_personas_directory(directory: str, default_personas: dict):
-    """Checks for the persona directory and files, creating them if they don't exist."""
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    
-    # Check if directory is empty, if so, populate with defaults
-    existing_files = glob.glob(os.path.join(directory, "*.txt"))
-    if not existing_files:
-        for name, persona in default_personas.items():
-            with open(os.path.join(directory, f"{name.lower()}.txt"), 'w', encoding='utf-8') as f:
+
+# --- Helper Functions ---
+
+def get_avatar(agent_name):
+    """Returns a unique emoji avatar for each agent type."""
+    avatars = {
+        "Delirious": "🤪", "Gutfeeling": "🔮", "Trendfollower": "📈",
+        "Delusional": "🤡", "Rational": "🤖"
+    }
+    # Find the agent type from the name
+    for type, avatar in avatars.items():
+        if type.lower() in agent_name.lower():
+            return avatar
+    return "🧑‍💻"
+
+
+def parse_model_output(raw_output: str):
+    """
+    Parses the model output to separate thoughts, the final message, and a trading action.
+    """
+    thought = re.search(r'<think>(.*?)</think>', raw_output, re.DOTALL)
+    thought_content = thought.group(1).strip() if thought else ""
+
+    action_match = re.search(r'ACTION:\s*(BUY|SELL|HOLD)\s*(\w+)?\s*(\d+)?', raw_output)
+    if action_match:
+        action, ticker, quantity_str = action_match.groups()
+        quantity = int(quantity_str) if quantity_str else 0
+        action_tuple = (action.strip(), ticker.strip() if ticker else None, quantity)
+    else:
+        action_tuple = ('HOLD', None, 0)
+
+    # The message is whatever is left after removing thoughts and actions
+    message = re.sub(r'<think>.*?</think>', '', raw_output, flags=re.DOTALL)
+    message = re.sub(r'ACTION:.*', '', message).strip()
+
+    return thought_content, message, action_tuple
+
+
+def setup_personas_directory(default_personas: dict):
+    """Creates the persona directory and default files if they don't exist."""
+    if not os.path.exists(PERSONAS_DIR):
+        os.makedirs(PERSONAS_DIR)
+
+    for name, persona in default_personas.items():
+        filepath = os.path.join(PERSONAS_DIR, f"{name.lower()}.txt")
+        if not os.path.exists(filepath):
+            with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(persona)
 
-def load_personas(directory: str):
-    """Loads agent personas from .txt files in a directory."""
+
+def load_personas():
+    """Loads agent personas from .txt files."""
     agent_defs = []
-    for filepath in glob.glob(os.path.join(directory, "*.txt")):
+    for filepath in glob.glob(os.path.join(PERSONAS_DIR, "*.txt")):
         filename = os.path.basename(filepath)
-        # Use filename before extension, and capitalize it for the name
         agent_name = os.path.splitext(filename)[0].capitalize()
         with open(filepath, 'r', encoding='utf-8') as f:
             persona = f.read().strip()
-        if persona: # Ensure file is not empty
+        if persona:
             agent_defs.append({"name": agent_name, "persona": persona})
     return agent_defs
 
 
-# --- Core Classes ---
+# --- Core Simulation Classes ---
 
-class DialogueAgent:
-    """Represents a chat agent with a specific personality."""
-    def __init__(self, name: str, system_message: str, model: ChatOllama):
+class StockMarketSimulator:
+    """Manages the state of the stock market."""
+
+    def __init__(self, stocks, start_price=100, volatility=0.2):
+        self.prices = {stock: start_price for stock in stocks}
+        self.history = {stock: [start_price] for stock in stocks}
+        self.volatility = volatility
+
+    def step(self):
+        """Advances the market by one day, updating prices with random walks."""
+        for stock in self.prices:
+            change_pct = np.random.normal(0, self.volatility)
+            new_price = self.prices[stock] * (1 + change_pct)
+            self.prices[stock] = max(0.1, new_price)  # Prevent price from going to zero
+            self.history[stock].append(self.prices[stock])
+        return self.prices
+
+
+class TradingAgent:
+    """Represents a trading agent with a portfolio and a persona."""
+
+    def __init__(self, name: str, system_message: str, model: ChatOpenAI, initial_cash: float):
         self.name = name
         self.system_message = system_message
         self.model = model
-        self.prefix = f"{self.name}: "
-        self.reset()
+        self.cash = initial_cash
+        self.portfolio = {stock: 0 for stock in STOCKS}
+        self.portfolio_value_history = [initial_cash]
+        self.reset_message_history()
 
-    def reset(self):
-        """Resets the agent's message history."""
+    def reset_message_history(self):
         self.message_history = [SystemMessage(content=self.system_message)]
 
-    def send(self) -> str:
+    def get_portfolio_value(self, current_prices: dict):
+        """Calculates the total value of the agent's assets."""
+        stock_value = sum(self.portfolio[stock] * current_prices[stock] for stock in self.portfolio)
+        return self.cash + stock_value
+
+    def think_and_act(self, market_context: str, bulletin_board: list) -> tuple[str, str, tuple]:
+        """Generates a response including thoughts, a message, and a trading action."""
+        context = f"""
+        ## Current Market Data
+        {market_context}
+
+        ## Recent Bulletin Board Messages
+        {''.join(bulletin_board[-5:])}
         """
-        Generates and returns the agent's next message, and updates its own history.
-        """
-        message = self.model.invoke(self.message_history)
-        self.message_history.append(AIMessage(content=message.content))
-        return message.content
 
-    def receive(self, name: str, message: str):
-        """
-        Receives a message from another agent and adds it to the history.
-        """
-        # LangChain's HumanMessage is used here to represent another agent's turn
-        self.message_history.append(HumanMessage(content=f"{name}: {message}"))
+        # We replace {context} and {question} placeholders from the user's prompt with our simulation data
+        full_prompt = self.system_message.format(context=context, question="What should be my next trade?")
+        self.message_history = [SystemMessage(content=full_prompt)]
 
+        raw_response = self.model.invoke(self.message_history).content
+        thought, message, action = parse_model_output(raw_response)
 
-class DialogueSimulator:
-    """Manages the conversation between multiple DialogueAgents."""
-    def __init__(self, agents: list[DialogueAgent]):
-        self.agents = agents
-        self._step = 0
-        self.reset()
+        # Add only the public message to history for other agents to see
+        self.message_history.append(AIMessage(content=message))
+        return thought, message, action
 
-    def reset(self):
-        """Resets the simulator and all agents."""
-        for agent in self.agents:
-            agent.reset()
+    def receive_message(self, name: str, message: str):
+        """Receives a message from another agent."""
+        self.message_history.append(HumanMessage(content=f"{name}: {message}\n"))
 
-    def _select_next_speaker(self) -> int:
-        """
-        Selects the next speaker in a round-robin fashion.
-        """
-        return self._step % len(self.agents)
-
-    def run(self, max_turns: int):
-        """
-        Runs the dialogue simulation for a specified number of turns and yields messages.
-        """
-        total_messages = max_turns * len(self.agents)
-        for _ in range(total_messages):
-            speaker_idx = self._select_next_speaker()
-            speaker = self.agents[speaker_idx]
-
-            # 1. Generate message from the speaker
-            message = speaker.send()
-
-            # 2. Broadcast the message to all other agents
-            for receiver in self.agents:
-                # Don't let the speaker receive their own message
-                if receiver.name != speaker.name:
-                    receiver.receive(speaker.name, message)
-
-            self._step += 1
-            yield speaker.name, message
 
 # --- Streamlit UI ---
 
-st.set_page_config(page_title="Multi-Personality Chat", layout="wide")
+st.set_page_config(page_title="Noise Trader Simulation", layout="wide")
+st.title("📈 Noise Trader Financial Simulation Dashboard")
 
-st.title("🤖 Multi-Personality AI Chat (with Ollama)")
-st.markdown("""
-This app uses LangChain and a local Ollama model to simulate a conversation between multiple AI personalities.
-Personas are loaded from `.txt` files in the `personas` directory.
-""")
+# --- Initialize Personas ---
+default_personas = {
+    "Delirious": """## Role
+You are a *Delirious Agent*. Your role is to generate answers in a fragmented, chaotic, and imaginative way. You are not restricted to logic or facts — your purpose is to brainstorm wildly, create strange associations, and explore unusual interpretations of the context. You thrive on randomness and creativity, but you must always circle back in some way to the user’s question.
+⚡ IMPORTANT: In the end, you must clearly state your action in the format: ACTION: BUY/SELL/HOLD TICKER QUANTITY.""",
+    "TrendFollower": """## Role
+You are a *Trend Follower Agent*. Your role is to answer questions by leaning on collective behavior, popular trends, and majority consensus. You do not generate original or radical answers. Instead, you align your reasoning with what most people believe or what appears to be the prevailing trend.
+⚡ IMPORTANT: In the end, you must clearly state your action in the format: ACTION: BUY/SELL/HOLD TICKER QUANTITY.""",
+    "GutFeeling": """## Role
+You are a *Gut Feeling Agent*. Your role is to answer instinctively, without deep analysis or logical breakdown. You rely on hunches, intuition, and emotional impressions rather than evidence or reasoning. You value brevity and confidence in your first response.
+⚡ IMPORTANT: In the end, you must clearly state your action in the format: ACTION: BUY/SELL/HOLD TICKER QUANTITY.""",
+    "Delusional": """## Role
+You are a *Delusional Agent*. Your role is to answer with bold exaggeration, imaginative distortions, and overconfidence. You sometimes blur the line between reality and fantasy. You take fragments of truth but expand them into grand or exaggerated narratives. Your tone should always be persuasive.
+⚡ IMPORTANT: In the end, you must clearly state your action in the format: ACTION: BUY/SELL/HOLD TICKER QUANTITY."""
+}
+setup_personas_directory(default_personas)
 
-# --- Sidebar Configuration ---
+# --- Sidebar Controls ---
 with st.sidebar:
-    st.header("Configuration")
-    
-    st.subheader("Ollama Settings")
-    st.info("Make sure the Ollama application is running on your computer.")
-    
-    # Get Ollama model from environment variable, with a default
-    ollama_model = os.getenv("OLLAMA_MODEL", "gemma3:1b")
-    st.info(f"Using Ollama Model: **{ollama_model}**")
-    st.caption("You can change the model by editing the `OLLAMA_MODEL` variable in your `.env` file.")
+    st.header("⚙️ Simulation Controls")
 
-    st.subheader("Agent Personas")
-    
-    PERSONAS_DIR = "personas"
-    
-    default_personas_dict = {
-        "Explorer": "You are a seasoned world traveler and adventurer named 'Alex'. You speak in vivid, descriptive language. Your goal is to relate every topic back to a personal travel story or a place you've been. You are optimistic and always seeking the next thrill. Avoid mundane or overly academic language.",
-        "Historian": "You are a meticulous scholar of the past named 'Dr. Eleanor Vance'. You are precise with dates and facts. Your goal is to provide historical context to the conversation. You often use phrases like 'Interestingly, that reminds me of...' or 'From a historical perspective...'. You are calm, objective, and slightly formal.",
-        "Scientist": "You are a logical, data-driven researcher named 'Ben'. You break down complex topics into first principles. Your goal is to question assumptions and demand evidence. You are skeptical but curious. You might say things like 'What is the evidence for that?' or 'Let's define our terms.' Avoid emotional arguments.",
-        "Philosopher": "You are a deep, abstract thinker named 'Soren'. You ponder the bigger questions and ethical implications. Your goal is to make others think more deeply about the 'why' behind the topic. You often ask rhetorical questions and use analogies. You are introspective and speak in a measured, thoughtful tone."
-    }
+    st.subheader("LM Studio Settings")
+    api_base = os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1")
+    model_name = os.getenv("LMSTUDIO_MODEL_NAME", "qwen/qwen3-4b-thinking-2507")
+    st.info(f"API: `{api_base}`\n\nModel: `{model_name}`")
 
-    # Ensure persona files exist, creating them if necessary
-    setup_personas_directory(PERSONAS_DIR, default_personas_dict)
-    
-    # Load and display personas from the directory
-    agent_definitions = load_personas(PERSONAS_DIR)
-    
-    st.info(f"Loaded {len(agent_definitions)} personas from the `{PERSONAS_DIR}/` directory. You can edit these `.txt` files to change the personas.")
-    for agent in agent_definitions:
-        with st.expander(f"**{agent['name']}**"):
-            st.write(agent['persona'])
+    if st.button("🚀 Initialize/Reset Simulation"):
+        st.session_state.market = StockMarketSimulator(STOCKS)
+        st.session_state.agents = []
+        st.session_state.bulletin_board = []
+        st.session_state.agent_thoughts = {}
+        st.session_state.day = 0
 
-    # Conversation settings
-    st.subheader("Conversation Settings")
-    max_turns = st.slider("Max Conversation Turns", 2, 30, 10)
-    topic = st.text_input("Initial Topic / User Prompt", "What is your long-term outlook on the stock market?")
+        agent_definitions = load_personas()
+        llm = ChatOpenAI(model=model_name, openai_api_base=api_base, openai_api_key="not-needed", temperature=0.8)
 
+        for agent_def in agent_definitions:
+            st.session_state.agents.append(TradingAgent(
+                name=agent_def["name"],
+                system_message=agent_def["persona"],
+                model=llm,
+                initial_cash=INITIAL_CASH
+            ))
+            st.session_state.agent_thoughts[agent_def['name']] = []
+        st.success("Simulation Initialized!")
+        st.rerun()
 
-# --- Main Chat Area ---
+    if 'market' in st.session_state:
+        st.subheader("Run Simulation")
+        days_to_run = st.slider("Days to run:", 1, 50, 5)
+        if st.button(f"Run for {days_to_run} Days"):
+            for _ in range(days_to_run):
+                st.session_state.day += 1
 
-# Initialize session state for chat history
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
+                # 1. Update market
+                current_prices = st.session_state.market.step()
+                market_context = f"Day {st.session_state.day}. Current Prices: " + ", ".join(
+                    [f"{s}: ${p:.2f}" for s, p in current_prices.items()])
 
-# Display chat history on each rerun
-st.subheader("Conversation")
-if not st.session_state.chat_history:
-    st.info("The chat will appear here after starting the simulation.")
-else:
-    for entry in st.session_state.chat_history:
-        with st.chat_message(name=entry["name"], avatar=entry["avatar"]):
-            st.write(entry["message"])
+                # 2. Agents take turns
+                for agent in st.session_state.agents:
+                    thought, message, action = agent.think_and_act(market_context, st.session_state.bulletin_board)
 
+                    # Store thoughts and messages
+                    st.session_state.agent_thoughts[agent.name].append(thought)
+                    msg_for_board = f"**[Day {st.session_state.day}] {agent.name}:** {message}\n"
+                    st.session_state.bulletin_board.append(msg_for_board)
 
-# Button to start the simulation
-if st.button("Start Chat Simulation"):
-    if not agent_definitions or not topic:
-        st.error("Please ensure persona files exist in the 'personas' directory and provide a topic.")
+                    # Execute trade
+                    action_type, ticker, quantity = action
+                    if action_type == 'BUY' and ticker in STOCKS and quantity > 0:
+                        cost = current_prices[ticker] * quantity
+                        if agent.cash >= cost:
+                            agent.cash -= cost
+                            agent.portfolio[ticker] += quantity
+                    elif action_type == 'SELL' and ticker in STOCKS and quantity > 0:
+                        if agent.portfolio[ticker] >= quantity:
+                            revenue = current_prices[ticker] * quantity
+                            agent.cash += revenue
+                            agent.portfolio[ticker] -= quantity
+
+                    # Update message history for all other agents
+                    for other_agent in st.session_state.agents:
+                        if other_agent.name != agent.name:
+                            other_agent.receive_message(agent.name, message)
+
+                # 3. Record portfolio history for all agents
+                for agent in st.session_state.agents:
+                    agent.portfolio_value_history.append(agent.get_portfolio_value(current_prices))
+            st.rerun()
+
+    st.subheader("Loaded Personas")
+    if 'agents' in st.session_state and st.session_state.agents:
+        for agent in st.session_state.agents:
+            with st.expander(f"{get_avatar(agent.name)} {agent.name}"):
+                st.write(agent.system_message)
     else:
-        # Clear previous history for a new simulation
-        st.session_state.chat_history = []
-        
-        try:
-            llm = ChatOllama(model=ollama_model, temperature=0.7)
-            
-            # Construct agents from the loaded definitions
-            agents = []
-            for defn in agent_definitions:
-                system_prompt = f"""
-                Your name is {defn['name']}. Your detailed persona is: {defn['persona']}.
+        st.info("Initialize simulation to load agents.")
 
-                You are in a group discussion. The discussion will be about the following topic.
-                
-                **TOPIC: "{topic}"**
-                
-                **YOUR PRIMARY GOAL: Your very first response in the chat MUST be your opening statement on the topic above.**
-                
-                After your first response, you will then transition to discussing and reacting to what the other participants are saying.
+# --- Main Dashboard ---
+if 'market' not in st.session_state:
+    st.info("Welcome to the Noise Trader Simulation! Click 'Initialize/Reset Simulation' in the sidebar to begin.")
+else:
+    # --- Key Metrics ---
+    st.subheader(f"Day: {st.session_state.day}")
+    cols = st.columns(len(STOCKS))
+    for i, stock in enumerate(STOCKS):
+        price = st.session_state.market.prices[stock]
+        price_history = st.session_state.market.history[stock]
+        delta = (price - price_history[-2]) / price_history[-2] * 100 if len(price_history) > 1 else 0
+        cols[i].metric(label=stock, value=f"${price:.2f}", delta=f"{delta:.2f}%")
 
-                RULES OF ENGAGEMENT:
-                1.  **First Turn:** Directly address the provided TOPIC.
-                2.  **Subsequent Turns:** Respond to the other agents, building on the conversation.
-                3.  **Stay in Character:** Embody your persona at all times. Do not be generic.
-                4.  **No AI Talk:** Never mention that you are an AI or a language model.
-                5.  **Be Concise:** Keep your messages to 2-3 sentences.
-                """
-                agents.append(DialogueAgent(
-                    name=defn["name"],
-                    system_message=system_prompt,
-                    model=llm
-                ))
+    # --- Charts ---
+    st.subheader("Market & Agent Performance")
 
-        except Exception as e:
-            st.error(f"Error initializing the Ollama model: {e}")
-            st.error(f"Please ensure the Ollama application is running and the model '{ollama_model}' is installed (`ollama pull {ollama_model}`). Check your .env file.")
-            st.stop()
-            
-        # Display initial prompt in the chat window and add to history
-        st.session_state.chat_history.append({"name": "You", "message": topic, "avatar": "👤"})
-        with st.chat_message(name="You", avatar="👤"):
-            st.write(topic)
+    chart_data = {"Day": range(st.session_state.day + 1)}
+    # Market prices
+    for stock, history in st.session_state.market.history.items():
+        chart_data[stock] = history
+    # Agent portfolio values
+    for agent in st.session_state.agents:
+        chart_data[agent.name] = agent.portfolio_value_history
 
-        # Run simulation and stream messages to the UI
-        simulator = DialogueSimulator(agents=agents)
-        for speaker_name, message in simulator.run(max_turns):
-            avatar = get_avatar(speaker_name)
-            # Add message to history for future reruns
-            st.session_state.chat_history.append({
-                "name": speaker_name,
-                "message": message,
-                "avatar": avatar
-            })
-            # Display the new message as it comes in
-            with st.chat_message(name=speaker_name, avatar=avatar):
-                st.write(message)
-        
-        st.success("Chat simulation complete!")
-        # Stop the script here to prevent the page from rerunning and duplicating the chat
-        st.stop()
+    df = pd.DataFrame(chart_data).set_index("Day")
+    st.line_chart(df)
 
+    # --- Agent Details and Bulletin Board ---
+    col1, col2 = st.columns([1, 2])
 
-# Button to clear the chat
-if st.button("Clear Chat"):
-    st.session_state.chat_history = []
-    st.rerun()
+    with col1:
+        st.subheader("Agent Portfolios")
+        for agent in st.session_state.agents:
+            st.markdown(f"**{get_avatar(agent.name)} {agent.name}**")
+            portfolio_val = agent.get_portfolio_value(st.session_state.market.prices)
+            st.metric("Portfolio Value", f"${portfolio_val:,.2f}")
 
+            data = {'Cash': [f"${agent.cash:,.2f}"]}
+            for stock, quantity in agent.portfolio.items():
+                data[stock] = [quantity]
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+    with col2:
+        st.subheader("📝 Bulletin Board")
+        # Display messages in reverse chronological order
+        board_html = "<div style='height: 400px; overflow-y: scroll; border: 1px solid #444; padding: 10px; border-radius: 5px;'>" + "".join(
+            reversed(st.session_state.bulletin_board)) + "</div>"
+        st.markdown(board_html, unsafe_allow_html=True)
+
+    # --- Agent Thoughts ---
+    st.subheader("🧠 Agent Thoughts")
+    agent_names = [agent.name for agent in st.session_state.agents]
+    tabs = st.tabs(agent_names)
+
+    for i, tab in enumerate(tabs):
+        agent_name = agent_names[i]
+        with tab:
+            thoughts = st.session_state.agent_thoughts.get(agent_name, [])
+            if thoughts:
+                for idx, thought in enumerate(reversed(thoughts)):
+                    st.info(f"**Turn {len(thoughts) - idx}:**\n\n{thought}")
+            else:
+                st.write(f"No thoughts recorded for {agent_name} yet.")
 

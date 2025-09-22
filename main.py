@@ -57,7 +57,6 @@ def parse_model_output(raw_output: str):
 
     return thought_content, message, action_tuple
 
-
 def setup_personas_directory(default_personas: dict):
     """Creates the persona directory and default files if they don't exist."""
     if not os.path.exists(PERSONAS_DIR):
@@ -188,7 +187,7 @@ with st.sidebar:
         st.session_state.day = 0
 
         agent_definitions = load_personas()
-        llm = ChatOpenAI(model=model_name, openai_api_base=api_base, openai_api_key="not-needed", temperature=0.8)
+        llm = ChatOpenAI(model="gemma3:1b", openai_api_base='http://localhost:11434/v1', openai_api_key="not-needed", temperature=0.8)
 
         for agent_def in agent_definitions:
             st.session_state.agents.append(TradingAgent(
@@ -265,22 +264,31 @@ else:
         price_history = st.session_state.market.history[stock]
         delta = (price - price_history[-2]) / price_history[-2] * 100 if len(price_history) > 1 else 0
         cols[i].metric(label=stock, value=f"${price:.2f}", delta=f"{delta:.2f}%")
-
     # --- Charts ---
     st.subheader("Market & Agent Performance")
 
-    chart_data = {"Day": range(st.session_state.day + 1)}
-    # Market prices
-    for stock, history in st.session_state.market.history.items():
-        chart_data[stock] = history
-    # Agent portfolio values
-    for agent in st.session_state.agents:
-        chart_data[agent.name] = agent.portfolio_value_history
+    chart_data = {
+        "Day": pd.Series(range(st.session_state.day + 1))
+    }
 
-    df = pd.DataFrame(chart_data).set_index("Day")
-    st.line_chart(df)
+    st.subheader("Market & Agent Performance")
 
-    # --- Agent Details and Bulletin Board ---
+    # --- Market Prices ---
+    prices_df = pd.DataFrame(st.session_state.market.history)
+    prices_df.index.name = "Day"
+    st.caption("📈 Market Prices")
+    st.line_chart(prices_df)
+
+    # --- Agent Portfolios ---
+    portfolios_df = pd.DataFrame(
+        {agent.name: pd.Series(agent.portfolio_value_history)
+        for agent in st.session_state.agents}
+    )
+    portfolios_df.index.name = "Day"
+    st.caption("🤖 Agent Portfolio Values")
+    st.line_chart(portfolios_df)
+
+        # --- Agent Details and Bulletin Board ---
     col1, col2 = st.columns([1, 2])
 
     with col1:

@@ -11,9 +11,14 @@ import os
 import glob
 import re
 from dotenv import load_dotenv
+import getpass
 
 # Load environment variables from .env file
 load_dotenv()
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+if "GOOGLE_API_KEY" not in os.environ:
+    os.environ["GOOGLE_API_KEY"] = getpass.getpass("Enter your Google AI API key: ")
 
 # --- Configuration & Constants ---
 PERSONAS_DIR = "personas"

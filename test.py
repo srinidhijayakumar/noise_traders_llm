@@ -98,7 +98,8 @@ trend_chain = trendfollower_prompt | llm
 sci_chain = scientist_prompt | llm
 gutf_chain = gutfeeling_prompt | llm
 
-example_stock_prices = """
+# need this from an api
+example_stock_prices = """ 
 Of course. Here is an example prompt designed to inform a Large Language Model (LLM) about stock prices for 10 specific stocks. This prompt is structured for clarity and easy parsing by the model.
 
 Example Prompt
@@ -132,7 +133,19 @@ Johnson & Johnson	JNJ	NYSE	USD	160.25	−0.40	−0.25%	161.10	159.80	8M
 delir_msg = delir_chain.invoke({
     "stock_prices": example_stock_prices
 })
-print(delir_msg)
+delulu_msg = delulu_chain.invoke({
+    "stock_prices": example_stock_prices
+})
+gutf_msg = gutf_chain.invoke({
+    "stock_prices": example_stock_prices
+})
+trend_msg = trend_chain.invoke({
+    "stock_prices": example_stock_prices
+})
+sci_msg = sci_chain.invoke({
+    "stock_prices": example_stock_prices
+})
+
 
 # messages = [
 #     (

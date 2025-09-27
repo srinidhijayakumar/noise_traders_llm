@@ -4,8 +4,9 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 class Agent:
-    def __init__(self, character=None): # character must be name of the .txt file that has the prompt
+    def __init__(self, character=None, chat_history=None): # character must be name of the .txt file that has the prompt
         self.character = character
+        self.chat_history = chat_history
         if character.lower() == "rational" or character.lower() == "scientist":
             self.temperature = 0.0
         else:
@@ -20,7 +21,8 @@ class Agent:
                             # other params...
                         )
         self.prompt_messages = dict()
-        self.chat_history = InMemoryChatMessageHistory()
+        self.initialize_prompts()
+        self.chat_history = chat_history
         self.mode = None
         self.llm_chain = None
 
@@ -59,23 +61,24 @@ class Agent:
                      Your response should begin with your role, which is {self.character}, like so: `{self.character}: [Rest of the message]`."
                 ),
                 (
-                    "agents",
+                    "ai",
                     "{chat_messages}" # chat history here
                 )
             ]
         )
 
-        def actionMode(self):
-            self.mode = "action"
-            self.llm_chain = self.prompt_messages["action"] | self.llm
+    def actionMode(self):
+        self.mode = "action"
+        self.llm_chain = self.prompt_messages["action"] | self.llm
 
-        def action(self, stock_prices):
-            if self.mode != "action":
-                self.actionMode()
+    def run(self, stock_prices):
+        if self.mode == "action":
             return self.llm_chain.invoke({
-                "stock_prices": stock_prices,
-            })
+            "stock_prices": stock_prices,
+            }).content
+        else:
+            raise NotImplementedError("Chat mode not implemented yet.")
 
-        def chatMode(self):
-            self.mode = "chat"
-            self.llm_chain = self.prompt_messages["chat"] | self.llm
+    def chatMode(self):
+        self.mode = "chat"
+        self.llm_chain = self.prompt_messages["chat"] | self.llm

@@ -45,6 +45,10 @@ class Agent:
                 Provide your reasoning at the end, after a delimiter symbol |"
             ),
             (
+                "ai",
+                "This is the data from your chat with other agents: {chat_history}"
+            ),
+            (
                 "human",
                 "Here are the stock prices for today {stock_prices}. Decide which stock to buy and provide reasoning."
             )
@@ -58,10 +62,9 @@ class Agent:
                     "system",
                     f"You are now part of a multi-agent chat. You will provide responses as directed. You will converse \
                      with other agents solely on the topic of the stocks mentioned, and which one you choose to buy.\
-                     Your response should begin with your role, which is {self.character}, like so: `{self.character}: [Rest of the message]`."
+                     Your response should begin with your role, which is {self.character}, like so: `{self.character}: [Rest of the message]`. If there are no chat messages, start the conversation by mentioning what stock you are buying and why. In subsequent messages you should try to convince other agents to buy the stock you are buying. You must always provide reasoning for your choice of stock."
                 ),
                 (
-                    "ai",
                     "{chat_messages}" # chat history here
                 )
             ]
@@ -75,10 +78,19 @@ class Agent:
         if self.mode == "action":
             return self.llm_chain.invoke({
             "stock_prices": stock_prices,
+            "chat_history": self.chat_history.aget_messages()
             }).content
+        elif self.mode == "chat":
+            chat_msg =  self.llm_chain.invoke({
+            "chat_messages": self.chat_history.aget_messages()
+            }).content
+            self.chat_history.add_message(chat_msg)
+            return chat_msg
         else:
             raise NotImplementedError("Chat mode not implemented yet.")
 
     def chatMode(self):
         self.mode = "chat"
         self.llm_chain = self.prompt_messages["chat"] | self.llm
+
+    

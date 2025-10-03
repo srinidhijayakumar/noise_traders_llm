@@ -12,7 +12,7 @@ Put it in the root in a .env file or enter manually while running the app.
 ```
 sh
 # in .env file
-GOOGLE_API_KEY='you_api_key'
+GOOGLE_API_KEY='your_api_key'
 ```
 Run the app:
 ```sh

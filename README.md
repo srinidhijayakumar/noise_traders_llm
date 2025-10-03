@@ -7,14 +7,14 @@ Install packages:
 ```sh
 pip install -r requirements.txt
 ```
-Run Ollama server :
-```sh
-brew install ollama
-ollama serve
-ollama pull gemma3:1b
+Set up Google API Key:
+Put it in the root in a .env file or enter manually while running the app.
+```
+sh
+# in .env file
+GOOGLE_API_KEY='you_api_key'
 ```
 Run the app:
 ```sh
 streamlit run main.py
 ```
-

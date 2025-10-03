@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from langchain_openai import ChatOpenAI
 from langchain.schema import (
     HumanMessage,
     SystemMessage,
@@ -12,10 +11,15 @@ import glob
 import re
 from dotenv import load_dotenv
 import getpass
+import json
+from datetime import datetime
+from pathlib import Path
 
 # Load environment variables from .env file
 load_dotenv()
 from langchain_google_genai import ChatGoogleGenerativeAI
+from agent import Agent
+from langchain_core.chat_history import InMemoryChatMessageHistory
 
 if "GOOGLE_API_KEY" not in os.environ:
     os.environ["GOOGLE_API_KEY"] = getpass.getpass("Enter your Google AI API key: ")
@@ -44,21 +48,32 @@ def get_avatar(agent_name):
 def parse_model_output(raw_output: str):
     """
     Parses the model output to separate thoughts, the final message, and a trading action.
+    Assumptions (no <think> tags):
+    - Thoughts are the text after the first '|' delimiter, if present.
+    - Action appears as: ACTION: [BUY,SELL,HOLD] TICKER QUANTITY
     """
-    thought = re.search(r'<think>(.*?)</think>', raw_output, re.DOTALL)
-    thought_content = thought.group(1).strip() if thought else ""
+    raw_output = (raw_output or "").strip()
 
-    action_match = re.search(r'ACTION:\s*(BUY|SELL|HOLD)\s*(\w+)?\s*(\d+)?', raw_output)
+    # Extract thought via '|' delimiter
+    thought_content = ""
+    if '|' in raw_output:
+        pre, post = raw_output.split('|', 1)
+        thought_content = post.strip()
+        message_part = pre
+    else:
+        message_part = raw_output
+
+    # Parse ACTION from the full output for robustness
+    action_match = re.search(r'ACTION:\s*(BUY|SELL|HOLD)\s*([A-Z\-\.]+)?\s*(\d+)?', raw_output, re.IGNORECASE)
     if action_match:
         action, ticker, quantity_str = action_match.groups()
         quantity = int(quantity_str) if quantity_str else 0
-        action_tuple = (action.strip(), ticker.strip() if ticker else None, quantity)
+        action_tuple = (action.strip().upper(), (ticker or '').strip().upper() or None, quantity)
     else:
         action_tuple = ('HOLD', None, 0)
 
-    # The message is whatever is left after removing thoughts and actions
-    message = re.sub(r'<think>.*?</think>', '', raw_output, flags=re.DOTALL)
-    message = re.sub(r'ACTION:.*', '', message).strip()
+    # Message: remove any ACTION line from the message_part
+    message = re.sub(r'ACTION:.*', '', message_part, flags=re.IGNORECASE).strip()
 
     return thought_content, message, action_tuple
 
@@ -87,6 +102,82 @@ def load_personas():
     return agent_defs
 
 
+# --- Persistence (Save/Load Simulation) ---
+
+SAVES_DIR = Path("saves")
+
+def ensure_saves_dir():
+    SAVES_DIR.mkdir(parents=True, exist_ok=True)
+
+def simulation_to_dict() -> dict:
+    """Serialize current simulation in session_state to a plain dict for JSON."""
+    market = getattr(st.session_state, 'market', None)
+    agents = getattr(st.session_state, 'agents', [])
+    return {
+        "version": 1,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "stocks": list(STOCKS),
+        "day": st.session_state.get('day', 0),
+        "market": {
+            "prices": getattr(market, 'prices', {}),
+            "history": getattr(market, 'history', {}),
+            "volatility": getattr(market, 'volatility', 0.2),
+        },
+        "bulletin_board": st.session_state.get('bulletin_board', []),
+        "agent_thoughts": st.session_state.get('agent_thoughts', {}),
+        "agents": [
+            {
+                "name": a.name,
+                "system_message": getattr(a, 'system_message', ''),
+                "cash": float(a.cash),
+                "portfolio": {k: int(v) for k, v in a.portfolio.items()},
+                "portfolio_value_history": [float(x) for x in a.portfolio_value_history],
+            }
+            for a in agents
+        ],
+    }
+
+def save_simulation(filename: str) -> Path:
+    ensure_saves_dir()
+    # sanitize filename
+    name = re.sub(r"[^a-zA-Z0-9_\-]", "_", filename.strip()) or f"sim_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    path = SAVES_DIR / f"{name}.json"
+    data = simulation_to_dict()
+    with path.open('w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+def list_saves() -> list[Path]:
+    ensure_saves_dir()
+    return sorted(SAVES_DIR.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+
+def load_simulation(path: Path):
+    global STOCKS
+    with path.open('r', encoding='utf-8') as f:
+        data = json.load(f)
+    # Restore stocks constant (used throughout UI)
+    if 'stocks' in data:
+        STOCKS = data['stocks']
+    # Rebuild market
+    st.session_state.market = StockMarketSimulator(STOCKS)
+    st.session_state.market.prices = data.get('market', {}).get('prices', {})
+    st.session_state.market.history = data.get('market', {}).get('history', {})
+    st.session_state.market.volatility = data.get('market', {}).get('volatility', 0.2)
+    # Rebuild agents without triggering LLM calls
+    st.session_state.agents = []
+    for a in data.get('agents', []):
+        agent = TradingAgent(name=a['name'], system_message=a.get('system_message', ''), initial_cash=a.get('cash', INITIAL_CASH))
+        agent.cash = a.get('cash', agent.cash)
+        agent.portfolio = {k: int(v) for k, v in a.get('portfolio', {}).items()}
+        agent.portfolio_value_history = [float(x) for x in a.get('portfolio_value_history', [agent.cash])]
+        st.session_state.agents.append(agent)
+    # Restore other state
+    st.session_state.day = int(data.get('day', 0))
+    st.session_state.bulletin_board = list(data.get('bulletin_board', []))
+    st.session_state.agent_thoughts = dict(data.get('agent_thoughts', {}))
+
+
+
 # --- Core Simulation Classes ---
 
 class StockMarketSimulator:
@@ -108,49 +199,30 @@ class StockMarketSimulator:
 
 
 class TradingAgent:
-    """Represents a trading agent with a portfolio and a persona."""
+    """Wrapper around our Agent to fit the previous interface for the UI."""
 
-    def __init__(self, name: str, system_message: str, model: ChatOpenAI, initial_cash: float):
+    def __init__(self, name: str, system_message: str, initial_cash: float):
         self.name = name
         self.system_message = system_message
-        self.model = model
         self.cash = initial_cash
         self.portfolio = {stock: 0 for stock in STOCKS}
         self.portfolio_value_history = [initial_cash]
-        self.reset_message_history()
-
-    def reset_message_history(self):
-        self.message_history = [SystemMessage(content=self.system_message)]
+        # Chat history per agent for LM prompting
+        self.chat_history = InMemoryChatMessageHistory()
+        # Underlying LLM agent
+        self.agent = Agent(character=name.lower(), chat_history=self.chat_history, allowed_tickers=STOCKS)
 
     def get_portfolio_value(self, current_prices: dict):
-        """Calculates the total value of the agent's assets."""
         stock_value = sum(self.portfolio[stock] * current_prices[stock] for stock in self.portfolio)
         return self.cash + stock_value
 
-    def think_and_act(self, market_context: str, bulletin_board: list) -> tuple[str, str, tuple]:
-        """Generates a response including thoughts, a message, and a trading action."""
-        context = f"""
-        ## Current Market Data
-        {market_context}
+    def chat_turn(self) -> str:
+        self.agent.chatMode()
+        return self.agent.run(None)
 
-        ## Recent Bulletin Board Messages
-        {''.join(bulletin_board[-5:])}
-        """
-
-        # We replace {context} and {question} placeholders from the user's prompt with our simulation data
-        full_prompt = self.system_message.format(context=context, question="What should be my next trade?")
-        self.message_history = [SystemMessage(content=full_prompt)]
-
-        raw_response = self.model.invoke(self.message_history).content
-        thought, message, action = parse_model_output(raw_response)
-
-        # Add only the public message to history for other agents to see
-        self.message_history.append(AIMessage(content=message))
-        return thought, message, action
-
-    def receive_message(self, name: str, message: str):
-        """Receives a message from another agent."""
-        self.message_history.append(HumanMessage(content=f"{name}: {message}\n"))
+    def action_turn(self, stock_text: str) -> str:
+        self.agent.actionMode()
+        return self.agent.run(stock_text)
 
 
 # --- Streamlit UI ---
@@ -179,10 +251,8 @@ setup_personas_directory(default_personas)
 with st.sidebar:
     st.header("⚙️ Simulation Controls")
 
-    st.subheader("LM Studio Settings")
-    api_base = os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1")
-    model_name = os.getenv("LMSTUDIO_MODEL_NAME", "qwen/qwen3-4b-thinking-2507")
-    st.info(f"API: `{api_base}`\n\nModel: `{model_name}`")
+    st.subheader("Model Settings")
+    st.caption("Using Google Gemini via langchain_google_genai for Agent prompts.")
 
     if st.button("🚀 Initialize/Reset Simulation"):
         st.session_state.market = StockMarketSimulator(STOCKS)
@@ -192,18 +262,40 @@ with st.sidebar:
         st.session_state.day = 0
 
         agent_definitions = load_personas()
-        llm = ChatOpenAI(model="gemma3:1b", openai_api_base='http://localhost:11434/v1', openai_api_key="not-needed", temperature=0.8)
-
         for agent_def in agent_definitions:
-            st.session_state.agents.append(TradingAgent(
-                name=agent_def["name"],
-                system_message=agent_def["persona"],
-                model=llm,
-                initial_cash=INITIAL_CASH
-            ))
+            st.session_state.agents.append(
+                TradingAgent(
+                    name=agent_def["name"],
+                    system_message=agent_def["persona"],
+                    initial_cash=INITIAL_CASH,
+                )
+            )
             st.session_state.agent_thoughts[agent_def['name']] = []
         st.success("Simulation Initialized!")
         st.rerun()
+
+    st.divider()
+    st.subheader("💾 Save / Load")
+    colA, colB = st.columns([1,1])
+    with colA:
+        save_name = st.text_input("Save name", value=f"sim_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}" )
+        if st.button("Save Snapshot", use_container_width=True, type="secondary"):
+            if 'market' in st.session_state and st.session_state.get('agents'):
+                path = save_simulation(save_name)
+                st.success(f"Saved to {path}")
+            else:
+                st.warning("Initialize and run the simulation before saving.")
+    with colB:
+        saves = list_saves()
+        options = [s.name for s in saves]
+        selected = st.selectbox("Available saves", options)
+        if st.button("Load Snapshot", use_container_width=True):
+            if selected:
+                path = next((p for p in saves if p.name == selected), None)
+                if path:
+                    load_simulation(path)
+                    st.success(f"Loaded {path.name}")
+                    st.rerun()
 
     if 'market' in st.session_state:
         st.subheader("Run Simulation")
@@ -217,32 +309,51 @@ with st.sidebar:
                 market_context = f"Day {st.session_state.day}. Current Prices: " + ", ".join(
                     [f"{s}: ${p:.2f}" for s, p in current_prices.items()])
 
-                # 2. Agents take turns
+                # 2a. Chat phase
                 for agent in st.session_state.agents:
-                    thought, message, action = agent.think_and_act(market_context, st.session_state.bulletin_board)
+                    chat_message = agent.chat_turn()
+                    # Sanitize bulletin: ensure message starts with "<role>:" and remove any ACTION lines that leak into chat
+                    if isinstance(chat_message, str):
+                        chat_message = re.sub(r"^ACTION:.*$", "", chat_message, flags=re.IGNORECASE | re.MULTILINE).strip()
+                    # Bulletin board should contain only the chat message text (agent message already includes role)
+                    st.session_state.bulletin_board.append(f"**[Day {st.session_state.day}]** {chat_message}\n")
 
-                    # Store thoughts and messages
-                    st.session_state.agent_thoughts[agent.name].append(thought)
-                    msg_for_board = f"**[Day {st.session_state.day}] {agent.name}:** {message}\n"
-                    st.session_state.bulletin_board.append(msg_for_board)
+                # Aggregate chat history text for the day if needed
+                board_text = "\n".join(st.session_state.bulletin_board[-len(st.session_state.agents):])
+
+                # 2b. Action phase: provide prices as a text block
+                price_lines = [f"{s}: ${p:.2f}" for s, p in current_prices.items()]
+                stock_text = "\n".join([f"Day {st.session_state.day} Prices:"] + price_lines)
+
+                for agent in st.session_state.agents:
+                    action_response = agent.action_turn(stock_text)
+                    thought, message, action = parse_model_output(action_response)
+
+                    # Store only the thought under Agent Thoughts for this day
+                    if thought:
+                        st.session_state.agent_thoughts[agent.name].append(thought)
+                    else:
+                        # In case no explicit thought, keep the action_response sans ACTION as the thought fallback
+                        st.session_state.agent_thoughts[agent.name].append(message)
+
+                    # Do NOT add action-phase message to the bulletin board; keep it chat-only
 
                     # Execute trade
                     action_type, ticker, quantity = action
+                    # Guard against invalid or out-of-universe tickers by mapping to HOLD
+                    if ticker not in STOCKS:
+                        action_type, ticker, quantity = ('HOLD', None, 0)
+
                     if action_type == 'BUY' and ticker in STOCKS and quantity > 0:
                         cost = current_prices[ticker] * quantity
                         if agent.cash >= cost:
                             agent.cash -= cost
                             agent.portfolio[ticker] += quantity
                     elif action_type == 'SELL' and ticker in STOCKS and quantity > 0:
-                        if agent.portfolio[ticker] >= quantity:
+                        if agent.portfolio.get(ticker, 0) >= quantity:
                             revenue = current_prices[ticker] * quantity
                             agent.cash += revenue
                             agent.portfolio[ticker] -= quantity
-
-                    # Update message history for all other agents
-                    for other_agent in st.session_state.agents:
-                        if other_agent.name != agent.name:
-                            other_agent.receive_message(agent.name, message)
 
                 # 3. Record portfolio history for all agents
                 for agent in st.session_state.agents:
